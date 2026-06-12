@@ -624,6 +624,7 @@ async function toggleAdmin() {
       if (tag) tag.style.color = 'var(--yellow)';
     } else if (pw !== null) { alert('Fel lösenord.'); }
   }
+  if (currentTab === 'matchday') renderMatchday();
 }
 function extractPlayers(wb) {
   const players = [];
@@ -690,6 +691,77 @@ async function saveFacit(facit) {
   if (_facitRowId) { try { await supabase('DELETE', 'snapshots?id=eq.' + _facitRowId); } catch(e) {} }
   await supabase('POST', 'snapshots', { label: '__FACIT__', scores: facit });
 }
+// ── Live scoring helpers ────────────────────────────────────────
+function calcLivePoints() {
+  const pts = {};
+  VMDATA.players.forEach(p => {
+    let total = 0;
+    const tips = VMDATA.tips[p] || {};
+    Object.keys(FACIT).forEach(n => {
+      const res = FACIT[n];
+      const tip = tips[String(n)];
+      if (tip && res) total += matchPoints(tip, res);
+    });
+    pts[p] = total;
+  });
+  return pts;
+}
+function liveCurrentData() {
+  if (Object.keys(FACIT).length > 0) {
+    const pts = calcLivePoints();
+    return VMDATA.players.map(p => ({ name: p, points: pts[p] || 0 }))
+      .sort((a, b) => b.points - a.points || a.name.localeCompare(b.name, 'sv'));
+  }
+  if (snapshots.length > 0) {
+    const latest = snapshots[snapshots.length - 1];
+    return Object.entries(latest.scores).map(([name, points]) => ({ name, points }))
+      .sort((a, b) => b.points - a.points || a.name.localeCompare(b.name, 'sv'));
+  }
+  return [];
+}
+async function saveMatchResult(matchNum, date) {
+  const h = parseInt(document.getElementById('res-h-' + matchNum).value, 10);
+  const a = parseInt(document.getElementById('res-a-' + matchNum).value, 10);
+  if (isNaN(h) || isNaN(a)) { setStatus('Ange giltiga heltal för båda lagen.', true); return; }
+  FACIT[String(matchNum)] = [h, a];
+  loading(true, 'Sparar resultat...');
+  try {
+    await saveFacit(FACIT);
+    await loadSnapshots();
+    currentData = liveCurrentData();
+    renderMatchday();
+    renderLeaderboard(currentData);
+    renderMetricCards();
+    renderFacitStats();
+    await autoSnapshotIfComplete(date);
+  } catch(e) {
+    setStatus('Kunde inte spara: ' + e.message, true);
+  } finally {
+    loading(false);
+  }
+}
+async function autoSnapshotIfComplete(date) {
+  const dayMatches = matchdaySchedule().filter(m => m.d === date && m.n <= GROUP_LAST_MATCH);
+  const allDone = dayMatches.every(m => FACIT[String(m.n)]);
+  if (!allDone) return;
+  const label = shortDate(date);
+  const alreadyExists = (snapshots || []).some(s => s.label === label);
+  if (alreadyExists) return;
+  const pts = calcLivePoints();
+  try {
+    await supabase('POST', 'snapshots', { label, scores: pts });
+    await loadSnapshots();
+    currentData = liveCurrentData();
+    renderLeaderboard(currentData);
+    renderChart();
+    renderMetricCards();
+    renderTournamentStats();
+    setStatus('Snapshot "' + label + '" sparad automatiskt!');
+  } catch(e) {
+    setStatus('Snapshot misslyckades: ' + e.message, true);
+  }
+}
+// ── End Live scoring helpers ─────────────────────────────────────
 // ── End Facit ───────────────────────────────────────────────────
 function parseFile(file, callback) {
   loading(true, 'Läser fil...');
@@ -858,13 +930,17 @@ function renderLeaderboard(players) {
 
   // Normal standings
   // Rörelse + dagens poängskörd sedan förra speldagen (om historik finns)
+  // Only show arrows/gain if live points match latest snapshot exactly
   let prevRanks = null, dayGain = null;
   const histSnaps = (snapshots||[]).filter(s => s && s.scores);
   if (histSnaps.length >= 2) {
-    const mx = Math.max(0, ...Object.values(histSnaps[histSnaps.length-1].scores).map(Number));
-    if (mx > 0) {
+    const latestSnap = histSnaps[histSnaps.length-1].scores;
+    const mx = Math.max(0, ...Object.values(latestSnap).map(Number));
+    // Check if live data matches snapshot exactly before showing arrows
+    const liveMatchesSnap = players.every(p => Number(p.points) === Number(latestSnap[p.name] || 0));
+    if (mx > 0 && liveMatchesSnap) {
       prevRanks = snapRankMap(histSnaps[histSnaps.length-2].scores);
-      const prevS = histSnaps[histSnaps.length-2].scores, curS = histSnaps[histSnaps.length-1].scores;
+      const prevS = histSnaps[histSnaps.length-2].scores, curS = latestSnap;
       dayGain = {}; Object.keys(curS).forEach(n => dayGain[n] = (Number(curS[n])||0) - (Number(prevS[n])||0));
     }
   }
@@ -1057,8 +1133,7 @@ function clearDemoData() {
   if (_realSnapshots === null) { setStatus('Ingen exempeldata aktiv.'); return; }
   snapshots = _realSnapshots; _realSnapshots = null;
   FACIT = _realFacit || {}; _realFacit = null;
-  currentData = snapshots.length ? Object.entries(snapshots[snapshots.length-1].scores).map(([n,p])=>({name:n,points:p}))
-    .sort((a,b)=> b.points-a.points || a.name.localeCompare(b.name,'sv')) : [];
+  currentData = liveCurrentData();
   renderLeaderboard(currentData); renderChart(); renderMetricCards(); renderTournamentStats(); renderFacitStats();
   setStatus('Exempeldata rensad – riktig data återställd.');
 }
@@ -1176,7 +1251,12 @@ function renderChart() {
     : snapshots;
   if (src.length < 2) { canvas.style.display = 'none'; placeholder.style.display = 'flex'; renderChartFocus(); return; }
   canvas.style.display = 'block'; placeholder.style.display = 'none';
-  const labels = src.map(s => s.label);
+  const labels = src.map(s => {
+    // Use shortDate for labels that look like full dates (e.g. "fredag 12 jun" → "12 jun")
+    if (/^\d/.test(s.label)) return s.label;  // already short
+    const parts = s.label.match(/(\d+)\s+(\w+)$/);
+    return parts ? parts[1] + ' ' + parts[2] : s.label;
+  });
   const allNames = [...new Set(src.flatMap(s => Object.keys(s.scores)))];
   const datasets = allNames.map((name, i) => {
     const color = PALETTE[i % PALETTE.length];
@@ -1764,7 +1844,7 @@ let matchdayDate = null; // null = auto (today/next)
 let matchdayMode = 'all'; // always 'all' now
 
 const GROUP_LAST_MATCH = 72; // matches 1-72 = group stage (knockout teams not yet decided)
-const BONUSDATA = {"categories": ["Skyttekung", "Världsmästare", "Vinnare bronsmatch", "Lag som gör flest mål i gruppspelet", "Lag som släpper in flest mål i gruppspelet", "Vem kommer sist i tippet?", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?"], "labels": ["Skyttekung", "Världsmästare", "Vinnare bronsmatch", "Lag som gör flest mål i gruppspelet", "Lag som släpper in flest mål i gruppspelet", "Vem kommer sist i tippet?", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?"], "bonus": {"Ralle": {"Skyttekung": "Mbappe", "Världsmästare": "Frankrike", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Kap Verde", "Vem kommer sist i tippet?": "Jens", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sex"}, "Sparris": {"Skyttekung": "Mbappe", "Världsmästare": "Frankrike", "Vinnare bronsmatch": "Portugal", "Lag som gör flest mål i gruppspelet": "Portugal", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Sparris", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}, "Simon": {"Skyttekung": "Kane", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Frankrike", "Lag som släpper in flest mål i gruppspelet": "Curaco", "Vem kommer sist i tippet?": "TF", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sex"}, "Meuller": {"Skyttekung": "Havertz", "Världsmästare": "England", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fyra"}, "Yngwe": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Brasilien", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Jens", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Två"}, "Albin": {"Skyttekung": "Deniz Undav", "Världsmästare": "Brasilien", "Vinnare bronsmatch": "Portugal", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}, "Felle": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Frankrike", "Lag som släpper in flest mål i gruppspelet": "Kap Verde", "Vem kommer sist i tippet?": "Jens", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Två"}, "Jarmo": {"Skyttekung": "Kane", "Världsmästare": "Holland", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "Frankrike", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Jarmo", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Åtta"}, "Larsa": {"Skyttekung": "Kane", "Världsmästare": "Frankrike", "Vinnare bronsmatch": "Argentina", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Jens", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}, "Hilding": {"Skyttekung": "Kane", "Världsmästare": "England", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "England", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Tre"}, "Lundmark": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fyra"}, "TF": {"Skyttekung": "Raphinha", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Kap Verde", "Vem kommer sist i tippet?": "Tobbe", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Två"}, "Arke": {"Skyttekung": "Mbappe", "Världsmästare": "Frankrike", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Jens", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}, "Fejb": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Brasilien", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Larsa", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sex"}, "Tobbe": {"Skyttekung": "Haaland", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Norge", "Lag som gör flest mål i gruppspelet": "Portugal", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Mange", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Tre"}, "Danne Beng": {"Skyttekung": "Kane", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Tyskland", "Lag som gör flest mål i gruppspelet": "Brasilien", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fyra"}, "Knucke": {"Skyttekung": "Kane", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Portugal", "Lag som släpper in flest mål i gruppspelet": "Jordanien", "Vem kommer sist i tippet?": "Jens", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Tre"}, "Macke": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "England", "Lag som gör flest mål i gruppspelet": "Frankrike", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Jens", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sex"}, "Viking": {"Skyttekung": "Gyökeres", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "TF", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Nio"}, "Svante": {"Skyttekung": "Oyarzabal", "Världsmästare": "Spanien", "Vinnare bronsmatch": "England", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Uzbekistan", "Vem kommer sist i tippet?": "Larsa", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sju"}, "Jocke": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Hilding", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}}};
+const BONUSDATA = {"categories": ["Skyttekung", "Världsmästare", "Vinnare bronsmatch", "Lag som gör flest mål i gruppspelet", "Lag som släpper in flest mål i gruppspelet", "Vem kommer sist i tippet?", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?"], "labels": ["Skyttekung", "Världsmästare", "Vinnare bronsmatch", "Lag som gör flest mål i gruppspelet", "Lag som släpper in flest mål i gruppspelet", "Vem kommer sist i tippet?", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?"], "bonus": {"Ralle": {"Skyttekung": "Mbappe", "Världsmästare": "Frankrike", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Kap Verde", "Vem kommer sist i tippet?": "Jocke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sex"}, "Sparris": {"Skyttekung": "Mbappe", "Världsmästare": "Frankrike", "Vinnare bronsmatch": "Portugal", "Lag som gör flest mål i gruppspelet": "Portugal", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Sparris", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}, "Simon": {"Skyttekung": "Kane", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Frankrike", "Lag som släpper in flest mål i gruppspelet": "Curaco", "Vem kommer sist i tippet?": "TF", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sex"}, "Meuller": {"Skyttekung": "Havertz", "Världsmästare": "England", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fyra"}, "Yngwe": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Brasilien", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Viking", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Två"}, "Albin": {"Skyttekung": "Deniz Undav", "Världsmästare": "Brasilien", "Vinnare bronsmatch": "Portugal", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}, "Felle": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Frankrike", "Lag som släpper in flest mål i gruppspelet": "Kap Verde", "Vem kommer sist i tippet?": "Viking", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Två"}, "Jarmo": {"Skyttekung": "Kane", "Världsmästare": "Holland", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "Frankrike", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Jarmo", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Åtta"}, "Larsa": {"Skyttekung": "Kane", "Världsmästare": "Frankrike", "Vinnare bronsmatch": "Argentina", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}, "Hilding": {"Skyttekung": "Kane", "Världsmästare": "England", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "England", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Tre"}, "Lundmark": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fyra"}, "TF": {"Skyttekung": "Raphinha", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Kap Verde", "Vem kommer sist i tippet?": "Tobbe", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Två"}, "Arke": {"Skyttekung": "Mbappe", "Världsmästare": "Frankrike", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Viking", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}, "Fejb": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Brasilien", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Larsa", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sex"}, "Tobbe": {"Skyttekung": "Haaland", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Norge", "Lag som gör flest mål i gruppspelet": "Portugal", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Mange", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Tre"}, "Danne Beng": {"Skyttekung": "Kane", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Tyskland", "Lag som gör flest mål i gruppspelet": "Brasilien", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fyra"}, "Knucke": {"Skyttekung": "Kane", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Portugal", "Lag som släpper in flest mål i gruppspelet": "Jordanien", "Vem kommer sist i tippet?": "Jarmo", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Tre"}, "Macke": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "England", "Lag som gör flest mål i gruppspelet": "Frankrike", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Viking", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sex"}, "Viking": {"Skyttekung": "Gyökeres", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "TF", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Nio"}, "Svante": {"Skyttekung": "Oyarzabal", "Världsmästare": "Spanien", "Vinnare bronsmatch": "England", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Uzbekistan", "Vem kommer sist i tippet?": "Larsa", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sju"}, "Jocke": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Hilding", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}}};
 const KODATA = {"ko": {"Ralle": {"r32": ["Czechia", "Kanada", "Tyskland", "Australien", "Japan", "Brasilien", "Skottland", "Sverige", "Frankrike", "Nederländerna", "Elfenbenskusten", "Norge", "Mexiko", "Marocko", "England", "Senegal", "Turkiet", "Österrike", "Belgien", "Sydkorea", "Colombia", "Kroatien", "Spanien", "Algeriet", "Schweiz", "Iran", "Argentina", "Uruguay", "Portugal", "Ecuador", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Czechia", "Brasilien", "Sverige", "Norge", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Frankrike", "Brasilien", "Spanien", "Turkiet", "Norge", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "England", "Portugal"], "final": ["Frankrike", "England"]}, "Sparris": {"r32": ["Sydkorea", "Bosnien-Herzigovina", "Tyskland", "Marocko", "Nederländerna", "Skottland", "Brasilien", "Sverige", "Frankrike", "Japan", "Ecuador", "Norge", "Mexiko", "Elfenbenskusten", "England", "Senegal", "Turkiet", "Kanada", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Algeriet", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Sydkorea", "Skottland", "Brasilien", "Ecuador", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "Egypten", "Schweiz", "Portugal"], "qf": ["Frankrike", "Skottland", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "England", "Portugal"], "final": ["Frankrike", "England"]}, "Simon": {"r32": ["Mexiko", "Bosnien-Herzigovina", "Tyskland", "Skottland", "Nederländerna", "Brasilien", "Marocko", "Japan", "Frankrike", "Sverige", "Elfenbenskusten", "Norge", "Sydkorea", "Ecuador", "England", "Senegal", "Turkiet", "Kanada", "Belgien", "Czechia", "Colombia", "Ghana", "Spanien", "Österrike", "Schweiz", "Algeriet", "Argentina", "Uruguay", "Portugal", "Kroatien", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Mexiko", "Brasilien", "Marocko", "Norge", "Sydkorea", "England", "Colombia", "Spanien", "Turkiet", "Belgien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Frankrike", "Brasilien", "Spanien", "Turkiet", "Marocko", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "England", "Argentina"], "final": ["Spanien", "England"]}, "Meuller": {"r32": ["Czechia", "Kanada", "Tyskland", "Paraguay", "Nederländerna", "Marocko", "Brasilien", "Sverige", "Frankrike", "Japan", "Elfenbenskusten", "Norge", "Mexiko", "Skottland", "England", "Senegal", "USA", "Bosnien-Herzigovina", "Belgien", "Ecuador", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Algeriet", "Argentina", "Uruguay", "Portugal", "Ghana", "Turkiet", "Nya Zeeland"], "r16": ["Tyskland", "Frankrike", "Kanada", "Nederländerna", "Brasilien", "Norge", "Mexiko", "England", "Colombia", "Spanien", "USA", "Belgien", "Argentina", "Turkiet", "Schweiz", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Schweiz"], "sf": ["Frankrike", "Spanien", "England", "Argentina"], "final": ["Frankrike", "England"]}, "Yngwe": {"r32": ["Czechia", "Kanada", "Tyskland", "Paraguay", "Japan", "Marocko", "Brasilien", "Nederländerna", "Frankrike", "Sverige", "Ecuador", "Norge", "Mexiko", "Skottland", "England", "Elfenbenskusten", "Turkiet", "Algeriet", "Belgien", "Saudiarabien", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Egypten", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Iran"], "r16": ["Tyskland", "Frankrike", "Kanada", "Japan", "Brasilien", "Norge", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Saudiarabien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Frankrike", "Japan", "Spanien", "Turkiet", "Brasilien", "England", "Argentina", "Schweiz"], "sf": ["Frankrike", "Spanien", "Brasilien", "Argentina"], "final": ["Spanien", "Argentina"]}, "Albin": {"r32": ["Sydkorea", "Schweiz", "Tyskland", "Skottland", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Sverige", "Ecuador", "Norge", "Mexiko", "Uruguay", "England", "Senegal", "USA", "Kanada", "Belgien", "Czechia", "Portugal", "Kroatien", "Spanien", "Österrike", "Bosnien-Herzigovina", "Algeriet", "Argentina", "Saudiarabien", "Colombia", "Turkiet", "Paraguay", "Iran"], "r16": ["Tyskland", "Frankrike", "Sydkorea", "Nederländerna", "Brasilien", "Norge", "Mexiko", "England", "Portugal", "Spanien", "USA", "Belgien", "Argentina", "Iran", "Bosnien-Herzigovina", "Colombia"], "qf": ["Frankrike", "Nederländerna", "Portugal", "USA", "Brasilien", "England", "Argentina", "Bosnien-Herzigovina"], "sf": ["Frankrike", "Portugal", "Brasilien", "Argentina"], "final": ["Frankrike", "Brasilien"]}, "Felle": {"r32": ["Mexiko", "Kanada", "Tyskland", "Paraguay", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Sverige", "Ecuador", "Norge", "Sydkorea", "Skottland", "England", "Senegal", "Turkiet", "Elfenbenskusten", "Belgien", "Sydafrika", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Algeriet", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Mexiko", "Marocko", "Brasilien", "Norge", "Sydkorea", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "Egypten", "Schweiz", "Portugal"], "qf": ["Frankrike", "Marocko", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "Brasilien", "Portugal"], "final": ["Spanien", "Portugal"]}, "Jarmo": {"r32": ["Mexiko", "Bosnien-Herzigovina", "Tyskland", "Skottland", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Paraguay", "Ecuador", "Norge", "Sydkorea", "Saudiarabien", "England", "Kongo", "Turkiet", "Sverige", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Algeriet", "Schweiz", "Elfenbenskusten", "Argentina", "Uruguay", "Portugal", "Senegal", "USA", "Iran"], "r16": ["Tyskland", "Frankrike", "Mexiko", "Nederländerna", "Brasilien", "Norge", "Sydkorea", "England", "Kroatien", "Spanien", "Sverige", "Belgien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Nederländerna", "Spanien", "England", "Argentina"], "final": ["Nederländerna", "Argentina"]}, "Larsa": {"r32": ["Sydkorea", "Schweiz", "Tyskland", "Marocko", "Nederländerna", "Skottland", "Brasilien", "Japan", "Norge", "Sverige", "Elfenbenskusten", "Frankrike", "Mexiko", "Ecuador", "England", "Senegal", "Turkiet", "Bosnien-Herzigovina", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Österrike", "Kanada", "Algeriet", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Sverige", "Schweiz", "Nederländerna", "Brasilien", "Frankrike", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "Egypten", "Kanada", "Portugal"], "qf": ["Tyskland", "Nederländerna", "Spanien", "Belgien", "Frankrike", "England", "Argentina", "Kanada"], "sf": ["Tyskland", "Spanien", "Frankrike", "Argentina"], "final": ["Spanien", "Frankrike"]}, "Hilding": {"r32": ["Mexiko", "Kanada", "Tyskland", "Australien", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Sverige", "Ecuador", "Norge", "Czechia", "Skottland", "England", "Senegal", "USA", "Elfenbenskusten", "Belgien", "Uruguay", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Algeriet", "Argentina", "Saudiarabien", "Portugal", "Ghana", "Turkiet", "Iran"], "r16": ["Tyskland", "Frankrike", "Kanada", "Nederländerna", "Brasilien", "Norge", "Czechia", "England", "Kroatien", "Spanien", "USA", "Belgien", "Argentina", "Turkiet", "Schweiz", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "England", "Argentina"], "final": ["Frankrike", "England"]}, "Lundmark": {"r32": ["Sydkorea", "Kanada", "Tyskland", "Skottland", "Nederländerna", "Marocko", "Brasilien", "Sverige", "Frankrike", "Turkiet", "Elfenbenskusten", "Senegal", "Mexiko", "Ecuador", "England", "Uzbekistan", "USA", "Algeriet", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Iran", "Argentina", "Uruguay", "Portugal", "Norge", "Paraguay", "Egypten"], "r16": ["Tyskland", "Frankrike", "Kanada", "Nederländerna", "Brasilien", "Elfenbenskusten", "Mexiko", "England", "Kroatien", "Spanien", "USA", "Belgien", "Argentina", "Egypten", "Schweiz", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "England", "Argentina"], "final": ["Spanien", "England"]}, "TF": {"r32": ["Sydkorea", "Bosnien-Herzigovina", "Ecuador", "Paraguay", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Sverige", "Tyskland", "Senegal", "Mexiko", "Skottland", "Kroatien", "Norge", "USA", "Schweiz", "Belgien", "Czechia", "Colombia", "England", "Spanien", "Österrike", "Kanada", "Elfenbenskusten", "Argentina", "Uruguay", "Portugal", "Ghana", "Turkiet", "Egypten"], "r16": ["Ecuador", "Frankrike", "Sydkorea", "Marocko", "Brasilien", "Tyskland", "Mexiko", "Norge", "England", "Spanien", "USA", "Belgien", "Argentina", "Turkiet", "Kanada", "Portugal"], "qf": ["Frankrike", "Marocko", "Spanien", "Belgien", "Brasilien", "Norge", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "Brasilien", "Portugal"], "final": ["Spanien", "Portugal"]}, "Arke": {"r32": ["Czechia", "Schweiz", "Tyskland", "Paraguay", "Nederländerna", "Marocko", "Brasilien", "Sverige", "Frankrike", "Japan", "Ecuador", "Norge", "Mexiko", "Elfenbenskusten", "England", "Senegal", "Turkiet", "Bosnien-Herzigovina", "Belgien", "Sydkorea", "Colombia", "Kroatien", "Spanien", "Österrike", "Kanada", "Iran", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Czechia", "Nederländerna", "Brasilien", "Ecuador", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "USA", "Kanada", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "Brasilien", "Argentina"], "final": ["Frankrike", "Argentina"]}, "Fejb": {"r32": ["Sydkorea", "Bosnien-Herzigovina", "Tyskland", "Paraguay", "Nederländerna", "Marocko", "Brasilien", "Sverige", "Frankrike", "Japan", "Ecuador", "Norge", "Mexiko", "Skottland", "England", "Senegal", "Turkiet", "Kanada", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Algeriet", "Argentina", "Uruguay", "Portugal", "Elfenbenskusten", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Sydkorea", "Nederländerna", "Brasilien", "Norge", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "Egypten", "Schweiz", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Turkiet", "Brasilien", "Mexiko", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "Brasilien", "Portugal"], "final": ["Spanien", "Brasilien"]}, "Tobbe": {"r32": ["Sydkorea", "Kanada", "Tyskland", "Paraguay", "Nederländerna", "Marocko", "Brasilien", "Japan", "Norge", "Sverige", "Ecuador", "Frankrike", "Mexiko", "Skottland", "England", "Senegal", "Turkiet", "Bosnien-Herzigovina", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Elfenbenskusten", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Norge", "Sydkorea", "Marocko", "Brasilien", "Frankrike", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Norge", "Marocko", "Spanien", "Turkiet", "Frankrike", "England", "Argentina", "Portugal"], "sf": ["Norge", "Spanien", "Frankrike", "Portugal"], "final": ["Spanien", "Portugal"]}, "Danne Beng": {"r32": ["Czechia", "Bosnien-Herzigovina", "Tyskland", "Skottland", "Nederländerna", "Marocko", "Brasilien", "Sverige", "Frankrike", "Japan", "Ecuador", "Norge", "Mexiko", "Saudiarabien", "England", "Algeriet", "USA", "Kanada", "Belgien", "Sydkorea", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Iran", "Argentina", "Uruguay", "Portugal", "Elfenbenskusten", "Turkiet", "Egypten"], "r16": ["Tyskland", "Frankrike", "Czechia", "Nederländerna", "Brasilien", "Norge", "Mexiko", "England", "Kroatien", "Spanien", "Kanada", "Sydkorea", "Argentina", "Egypten", "Schweiz", "Portugal"], "qf": ["Tyskland", "Nederländerna", "Spanien", "Sydkorea", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Tyskland", "Spanien", "England", "Argentina"], "final": ["Spanien", "England"]}, "Knucke": {"r32": ["Czechia", "Kanada", "Tyskland", "Skottland", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Sverige", "Elfenbenskusten", "Norge", "Mexiko", "Ecuador", "England", "Senegal", "Turkiet", "Algeriet", "Belgien", "Sydkorea", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Iran", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Czechia", "Marocko", "Brasilien", "Norge", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Frankrike", "Marocko", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "Brasilien", "Portugal"], "final": ["Spanien", "Brasilien"]}, "Macke": {"r32": ["Sydkorea", "Kanada", "Tyskland", "Skottland", "Japan", "Marocko", "Brasilien", "Nederländerna", "Frankrike", "Sverige", "Ecuador", "Norge", "Mexiko", "Elfenbenskusten", "England", "Senegal", "USA", "Bosnien-Herzigovina", "Belgien", "Saudiarabien", "Portugal", "Kroatien", "Uruguay", "Österrike", "Schweiz", "Iran", "Argentina", "Spanien", "Colombia", "Ghana", "Turkiet", "Egypten"], "r16": ["Tyskland", "Frankrike", "Sydkorea", "Japan", "Brasilien", "Norge", "Mexiko", "England", "Kroatien", "Uruguay", "USA", "Belgien", "Spanien", "Turkiet", "Schweiz", "Colombia"], "qf": ["Frankrike", "Japan", "Kroatien", "Belgien", "Norge", "England", "Spanien", "Colombia"], "sf": ["Frankrike", "Kroatien", "England", "Spanien"], "final": ["Frankrike", "Spanien"]}, "Viking": {"r32": ["Mexiko", "Schweiz", "Tyskland", "Skottland", "Sverige", "Marocko", "Brasilien", "Nederländerna", "Frankrike", "Australien", "Elfenbenskusten", "Norge", "Czechia", "Ecuador", "England", "Senegal", "Turkiet", "Kanada", "Belgien", "Sydkorea", "Colombia", "Kroatien", "Spanien", "Österrike", "Bosnien-Herzigovina", "Algeriet", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Nya Zeeland"], "r16": ["Tyskland", "Frankrike", "Mexiko", "Sverige", "Brasilien", "Norge", "Czechia", "England", "Kroatien", "Spanien", "Kanada", "Belgien", "Argentina", "USA", "Bosnien-Herzigovina", "Portugal"], "qf": ["Frankrike", "Sverige", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "England", "Portugal"], "final": ["Spanien", "Portugal"]}, "Svante": {"r32": ["Sydkorea", "Kanada", "Tyskland", "Australien", "Nederländerna", "Marocko", "Brasilien", "Sverige", "Frankrike", "Japan", "Ecuador", "Norge", "Mexiko", "Skottland", "England", "Senegal", "Turkiet", "Bosnien-Herzigovina", "Belgien", "Algeriet", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Iran", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Kanada", "Nederländerna", "Brasilien", "Norge", "Skottland", "England", "Kroatien", "Spanien", "Bosnien-Herzigovina", "Belgien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Tyskland", "Nederländerna", "Spanien", "Belgien", "Norge", "England", "Argentina", "Portugal"], "sf": ["Tyskland", "Spanien", "England", "Portugal"], "final": ["Spanien", "Portugal"]}, "Jocke": {"r32": ["Sydkorea", "Kanada", "Tyskland", "Skottland", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Sverige", "Ecuador", "Norge", "Mexiko", "Elfenbenskusten", "England", "Algeriet", "USA", "Bosnien-Herzigovina", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Iran", "Argentina", "Uruguay", "Portugal", "Senegal", "Turkiet", "Egypten"], "r16": ["Tyskland", "Frankrike", "Sydkorea", "Nederländerna", "Brasilien", "Norge", "Mexiko", "England", "Colombia", "Spanien", "USA", "Belgien", "Argentina", "Egypten", "Schweiz", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Schweiz"], "sf": ["Frankrike", "Spanien", "England", "Argentina"], "final": ["Spanien", "Argentina"]}}};
 function matchdaySchedule() {
   return VMDATA.schedule.filter(m => m.n <= GROUP_LAST_MATCH);
@@ -1792,6 +1872,11 @@ function goToCurrentMatchday() {
   renderMatchday();
 }
 
+function shortDate(dstr) {
+  const d = new Date(dstr + 'T12:00:00');
+  const months = ['jan','feb','mar','apr','maj','jun','jul','aug','sep','okt','nov','dec'];
+  return d.getDate() + ' ' + months[d.getMonth()];
+}
 function fmtMatchDate(dstr) {
   const d = new Date(dstr + 'T12:00:00');
   const days = ['söndag','måndag','tisdag','onsdag','torsdag','fredag','lördag'];
@@ -1902,10 +1987,29 @@ function renderMatchday() {
         </span>`;
       }).join('');
 
+      const adminInput = adminMode ? (() => {
+        const existing = FACIT[String(m.n)];
+        const hVal = existing ? existing[0] : '';
+        const aVal = existing ? existing[1] : '';
+        const btnStyle = existing
+          ? 'padding:5px 12px;border-radius:6px;font-size:12px;border:1px solid var(--border);background:var(--surface);color:var(--muted);cursor:pointer;font-family:\'DM Sans\',sans-serif;'
+          : 'padding:5px 12px;border-radius:6px;font-size:12px;border:1px solid var(--yellow);background:rgba(255,218,0,0.12);color:var(--yellow);cursor:pointer;font-family:\'DM Sans\',sans-serif;font-weight:600;';
+        const btnLabel = existing ? 'Ändra' : 'Spara';
+        return `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          <span style="font-size:12px;color:var(--muted);flex:none;">Resultat:</span>
+          <span style="flex:1;text-align:right;font-size:14px;color:var(--text);">${m.h}</span>
+          <input id="res-h-${m.n}" type="number" min="0" value="${hVal}" placeholder="H" style="width:48px;padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:14px;text-align:center;font-family:\'DM Sans\',sans-serif;">
+          <span style="color:var(--muted);">–</span>
+          <input id="res-a-${m.n}" type="number" min="0" value="${aVal}" placeholder="B" style="width:48px;padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:14px;text-align:center;font-family:\'DM Sans\',sans-serif;">
+          <span style="font-size:14px;color:var(--text);">${m.a}</span>
+          <button onclick="saveMatchResult(${m.n}, '${active}')" style="${btnStyle}">${btnLabel}</button>
+        </div>`;
+      })() : '';
       return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1rem 1.1rem;margin-bottom:12px;">
         ${header}
         ${extra}
         <div style="display:flex;flex-wrap:wrap;gap:6px;">${chips}</div>
+        ${adminInput}
       </div>`;
     }).join('');
     if (!matches.length) body = '<p style="padding:1.5rem;text-align:center;color:var(--muted);font-size:14px;">Inga matcher denna dag</p>';
@@ -2013,24 +2117,23 @@ async function init() {
   document.getElementById('fetchBar').style.display = 'block';
   await loadSnapshots();
   document.getElementById('fetchBar').style.display = 'none';
-  if (snapshots.length > 0) {
-    const latest = snapshots[snapshots.length - 1];
-    currentData = Object.entries(latest.scores).map(([name, points]) => ({ name, points })).sort((a,b) => b.points - a.points || a.name.localeCompare(b.name, 'sv'));
+  if (snapshots.length > 0 || Object.keys(FACIT).length > 0) {
+    currentData = liveCurrentData();
     document.getElementById('uploadZone').style.display = 'none';
     document.getElementById('dashboard').style.display = 'block';
     renderLeaderboard(currentData); renderMetricCards(); renderChart(); renderTournamentStats(); renderFacitStats();
   }
+  let _lastFacitCount = Object.keys(FACIT).length;
   setInterval(async () => {
     if (_realSnapshots !== null) return; // exempeldata visas → pausa pollning
-    const prev = snapshots.length;
+    const prevSnaps = snapshots.length;
+    const prevFacit = _lastFacitCount;
     await loadSnapshots();
-    if (snapshots.length !== prev) {
+    _lastFacitCount = Object.keys(FACIT).length;
+    if (snapshots.length !== prevSnaps || _lastFacitCount !== prevFacit) {
+      currentData = liveCurrentData();
+      renderLeaderboard(currentData);
       renderChart(); renderMetricCards(); renderTournamentStats(); renderFacitStats();
-      if (snapshots.length > 0) {
-        const latest = snapshots[snapshots.length - 1];
-        currentData = Object.entries(latest.scores).map(([n,p])=>({name:n,points:p})).sort((a,b)=>b.points-a.points || a.name.localeCompare(b.name, 'sv'));
-        renderLeaderboard(currentData);
-      }
     }
   }, 30000);
 }
