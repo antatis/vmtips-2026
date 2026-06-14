@@ -1308,8 +1308,8 @@ function renderChart() {
           };
         } else {
           const maxVal = Math.max(...datasets.flatMap(d => d.data.filter(v => typeof v === 'number' && isFinite(v))));
-          const step = maxVal > 150 ? 20 : maxVal > 75 ? 10 : 5;
-          const yMax = Math.ceil((maxVal + step) / step) * step;
+          const step = maxVal > 150 ? 20 : maxVal > 75 ? 10 : maxVal > 30 ? 5 : 2;
+          const yMax = Math.ceil((maxVal + 2) / step) * step;
           return {
             y: {
               suggestedMax: yMax,
