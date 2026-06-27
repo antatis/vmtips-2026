@@ -513,6 +513,7 @@
         <button class="btn sm" onclick="loadDemoData()">👁 Visa exempeldata</button>
         <button class="btn sm danger" onclick="clearDemoData()">↺ Rensa exempel</button>
         <button class="btn sm danger" id="clearFacitBtn" style="display:none;" onclick="clearFacit()">🧹 Rensa facit</button>
+        <button class="btn sm danger" id="clearAdvBtn" style="display:none;" onclick="clearAdvancers()">🧹 Rensa slutspel</button>
         <span style="font-size:11px;color:var(--muted);align-self:center;">Bara lokalt – sparas inte.</span>
       </div>
     </div>
@@ -536,6 +537,8 @@ const SKIP_SHEETS = ['Poäng & instruktioner','Mitt slutspelsträd','Resultat & 
 
 let currentData = null, historyChart = null, currentView = 'points', adminMode = false, snapshots = [], chartFocus = null, chartHidden = new Set();
 let FACIT = {}, _facitRowId = null, _realFacit = null;
+let ADVANCERS = { r32:{}, winners:{} }, _advRowId = null, _realAdv = null;
+let BONUSFACIT = {}, _bonusRowId = null, _realBonus = null;
 
 function loading(show, msg='Sparar...') {
   document.getElementById('loadingOverlay').style.display = show ? 'flex' : 'none';
@@ -564,9 +567,17 @@ async function loadSnapshots() {
     const facitRow = all.find(s => s.label === '__FACIT__');
     FACIT = facitRow ? (facitRow.scores || {}) : {};
     _facitRowId = facitRow ? facitRow.id : null;
-    snapshots = all.filter(s => s.label !== '__FACIT__');
+    const advRow = all.find(s => s.label === '__ADVANCERS__');
+    ADVANCERS = advRow ? Object.assign({r32:{},winners:{}}, advRow.scores||{}) : {r32:{},winners:{}};
+    _advRowId = advRow ? advRow.id : null;
+    const bonusRow = all.find(s => s.label === '__BONUSFACIT__');
+    BONUSFACIT = bonusRow ? (bonusRow.scores||{}) : {};
+    _bonusRowId = bonusRow ? bonusRow.id : null;
+    snapshots = all.filter(s => s.label && !s.label.startsWith('__'));
     const cfBtn = document.getElementById('clearFacitBtn');
     if (cfBtn) cfBtn.style.display = _facitRowId ? 'inline-flex' : 'none';
+    const clearAdvBtn = document.getElementById('clearAdvBtn');
+    if (clearAdvBtn) clearAdvBtn.style.display = (_advRowId || (typeof hasAdvData==='function' && hasAdvData())) ? '' : 'none';
     updateFooter();
     return snapshots;
   } catch(e) { setStatus('Kunde inte hämta historik: ' + e.message, true); return []; }
@@ -687,6 +698,16 @@ function matchPoints(tip, res) {
   return p;
 }
 function isFullhit(tip, res) { return !!(tip && res && tip[0] === res[0] && tip[1] === res[1]); }
+async function saveAdvancers() {
+  if (_advRowId) { try { await supabase('DELETE', 'snapshots?id=eq.' + _advRowId); } catch(e) {} }
+  const row = await supabase('POST', 'snapshots', { label: '__ADVANCERS__', scores: ADVANCERS });
+  if (row && row[0] && row[0].id) _advRowId = row[0].id;
+  else if (row && row.id) _advRowId = row.id;
+}
+async function saveBonusFacit() {
+  if (_bonusRowId) { try { await supabase('DELETE', 'snapshots?id=eq.' + _bonusRowId); } catch(e) {} }
+  await supabase('POST', 'snapshots', { label: '__BONUSFACIT__', scores: BONUSFACIT });
+}
 async function saveFacit(facit) {
   if (_facitRowId) { try { await supabase('DELETE', 'snapshots?id=eq.' + _facitRowId); } catch(e) {} }
   await supabase('POST', 'snapshots', { label: '__FACIT__', scores: facit });
@@ -702,12 +723,14 @@ function calcLivePoints() {
       const tip = tips[String(n)];
       if (tip && res) total += matchPoints(tip, res);
     });
+    total += advancementPoints(p);
+    total += bonusPoints(p);
     pts[p] = total;
   });
   return pts;
 }
 function liveCurrentData() {
-  if (Object.keys(FACIT).length > 0) {
+  if (Object.keys(FACIT).length > 0 || hasAdvData() || hasBonusFacit()) {
     const pts = calcLivePoints();
     return VMDATA.players.map(p => ({ name: p, points: pts[p] || 0 }))
       .sort((a, b) => b.points - a.points || a.name.localeCompare(b.name, 'sv'));
@@ -741,8 +764,13 @@ async function saveMatchResult(matchNum, date) {
   }
 }
 async function autoSnapshotIfComplete(date) {
-  const dayMatches = matchdaySchedule().filter(m => m.d === date && m.n <= GROUP_LAST_MATCH);
-  const allDone = dayMatches.every(m => FACIT[String(m.n)]);
+  const dayMatches = VMDATA.schedule.filter(m => m.d === date);
+  const allDone = dayMatches.every(m => {
+    const hasResult = Array.isArray(FACIT[String(m.n)]);
+    if (m.n > GROUP_LAST_MATCH) return hasResult && (ADVANCERS.winners||{})[m.n];
+    return hasResult;
+  });
+  // allDone computed above
   if (!allDone) return;
   const label = shortDate(date);
   const alreadyExists = (snapshots || []).some(s => s.label === label);
@@ -1100,7 +1128,7 @@ function renderTournamentStats() {
 // ── Exempeldata (endast lokalt, sparas ej) ──────────────────────
 let _realSnapshots = null;
 function loadDemoData() {
-  if (_realSnapshots === null) { _realSnapshots = snapshots; _realFacit = FACIT; }
+  if (_realSnapshots === null) { _realSnapshots = snapshots; _realFacit = JSON.parse(JSON.stringify(FACIT)); _realAdv = JSON.parse(JSON.stringify(ADVANCERS)); _realBonus = JSON.parse(JSON.stringify(BONUSFACIT)); }
   const pls = VMDATA.players;
   // exempelfacit: låt facit för de första matcherna matcha en roterande spelares tips (garanterar fullträffar)
   const demoFacit = {};
@@ -1133,6 +1161,10 @@ function clearDemoData() {
   if (_realSnapshots === null) { setStatus('Ingen exempeldata aktiv.'); return; }
   snapshots = _realSnapshots; _realSnapshots = null;
   FACIT = _realFacit || {}; _realFacit = null;
+  ADVANCERS = _realAdv || {r32:{},winners:{}}; _realAdv = null;
+  BONUSFACIT = _realBonus || {}; _realBonus = null;
+  ADVANCERS = _realAdv || {r32:{},winners:{}}; _realAdv = null;
+  BONUSFACIT = _realBonus || {}; _realBonus = null;
   currentData = liveCurrentData();
   renderLeaderboard(currentData); renderChart(); renderMetricCards(); renderTournamentStats(); renderFacitStats();
   setStatus('Exempeldata rensad – riktig data återställd.');
@@ -1198,9 +1230,8 @@ function renderChartFocus() {
   const wrap = document.getElementById('chartFocusWrap');
   if (!wrap) return;
   const isRank = currentView === 'rank';
-  const src = isRank
-    ? (snapshots||[]).filter(s => s && s.scores && Math.max(0, ...Object.values(s.scores).map(Number)) > 0)
-    : (snapshots||[]);
+    const validSnaps = (snapshots||[]).filter(s => s && s.scores && (!s.label||!s.label.startsWith('__')) && Object.values(s.scores).every(v => typeof v === 'number'));
+  const src = isRank ? validSnaps : validSnaps;
   if (src.length < 2) { wrap.style.display = 'none'; return; }
   wrap.style.display = '';
   const allNames = [...new Set(src.flatMap(s => Object.keys(s.scores)))];
@@ -1246,9 +1277,8 @@ function renderChart() {
   if (historyChart) { historyChart.destroy(); historyChart = null; }
   const isRank = currentView === 'rank';
   // Placeringsvyn hoppar över startläget (alla på 0 = alla delad etta), poängvyn behåller det
-  const src = isRank
-    ? snapshots.filter(s => Math.max(0, ...Object.values(s.scores).map(Number)) > 0)
-    : snapshots;
+    const validSnaps = (snapshots||[]).filter(s => s && s.scores && (!s.label||!s.label.startsWith('__')) && Object.values(s.scores).every(v => typeof v === 'number'));
+  const src = isRank ? validSnaps : validSnaps;
   if (src.length < 2) { canvas.style.display = 'none'; placeholder.style.display = 'flex'; renderChartFocus(); return; }
   canvas.style.display = 'block'; placeholder.style.display = 'none';
   const labels = src.map(s => {
@@ -1304,7 +1334,7 @@ function renderChart() {
               ticks: { color: 'rgba(255,255,255,0.7)', font: { size: 12 }, callback: v => Number.isInteger(v) ? v : null },
               title: { display: true, text: 'Placering', color: 'rgba(255,230,32,0.8)', font: { size: 12 } }
             },
-            x: { grid: { color: 'rgba(255,230,32,0.08)' }, ticks: { color: 'rgba(255,255,255,0.7)', font: { size: 11 }, autoSkip: false, maxRotation: 35 } }
+            x: { grid: { color: 'rgba(255,230,32,0.08)' }, ticks: { color: 'rgba(255,255,255,0.7)', font: { size: 11 }, autoSkip: true, maxTicksLimit: 10, maxRotation: 45, minRotation: 0 } }
           };
         } else {
           const maxVal = Math.max(...datasets.flatMap(d => d.data.filter(v => typeof v === 'number' && isFinite(v))));
@@ -1317,7 +1347,7 @@ function renderChart() {
               ticks: { color: 'rgba(255,255,255,0.7)', font: { size: 12 }, stepSize: step, callback: v => Number.isInteger(v) ? v : null },
               title: { display: true, text: 'Poäng', color: 'rgba(255,230,32,0.8)', font: { size: 12 } }
             },
-            x: { grid: { color: 'rgba(255,230,32,0.08)' }, ticks: { color: 'rgba(255,255,255,0.7)', font: { size: 11 }, autoSkip: false, maxRotation: 35 } }
+            x: { grid: { color: 'rgba(255,230,32,0.08)' }, ticks: { color: 'rgba(255,255,255,0.7)', font: { size: 11 }, autoSkip: true, maxTicksLimit: 10, maxRotation: 45, minRotation: 0 } }
           };
         }
       })()
@@ -1654,6 +1684,7 @@ function renderSlutspel() {
     </div>`;
 
   return `<p class="section-title">Slutspel</p>
+    ${hasAdvData() ? `<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1rem 1.1rem;margin-bottom:16px;"><div style="font-size:13px;color:var(--yellow);font-weight:500;margin-bottom:10px;">Flest lag rätt – slutspel</div>${renderAdvTable()}</div>` : ''}
     ${block('Ensam om sin världsmästare 🏆', uniqueRows(uniqueChamp))}
     ${block('Ensam om en finalist', uniqueRows(uniqueFin))}
     ${block('Mest mot strömmen i slutspelet <span style="color:var(--muted);font-weight:400;font-size:11px;">(gult = avvikande lag)</span>', devRows)}
@@ -1667,6 +1698,7 @@ function renderSlutspel() {
 }
 
 function renderBonus() {
+  try {
   const pls = VMDATA.players;
   const cats = BONUSDATA.categories;
   const labels = BONUSDATA.labels;
@@ -1695,13 +1727,22 @@ function renderBonus() {
         </div>`;
     }).join('');
     return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1rem 1.1rem;margin-bottom:12px;">
-        <div style="font-size:14px;color:var(--yellow);font-weight:500;margin-bottom:8px;">${labels[ci]}</div>
+        ${adminMode ? `<div style="margin-bottom:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+          <span style="font-size:14px;color:var(--yellow);font-weight:500;flex:1;">${escHtml(labels[ci])}</span>
+          <input id="bfacit-${ci}" list="bfacit-list-${ci}" value="${escHtml(BONUSFACIT[cat]||'')}" placeholder="Facit..." style="flex:1;min-width:100px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px;font-family:'DM Sans',sans-serif;">
+          <datalist id="bfacit-list-${ci}">${[...new Set(Object.values(BONUSDATA.bonus).map(b=>b[cat]).filter(Boolean))].map(v=>`<option value="${escHtml(v)}">`).join('')}</datalist>
+          <button onclick="setBonusFacit(${ci}, document.getElementById('bfacit-${ci}').value)" style="padding:4px 10px;border-radius:6px;font-size:12px;border:1px solid var(--yellow);background:rgba(255,218,0,0.12);color:var(--yellow);cursor:pointer;">Spara</button>
+        </div>` : `<div style="font-size:14px;color:var(--yellow);font-weight:500;margin-bottom:8px;">${escHtml(labels[ci])}</div>`}
+        ${BONUSFACIT[cat] ? `<div style="font-size:12px;color:#63e6be;margin-bottom:8px;">Facit: ${escHtml(BONUSFACIT[cat])} · ${BONUS_POINTS[ci]}p till ${Object.values(BONUSDATA.bonus).filter(b=>bonusMatch(ci,b[cat],BONUSFACIT[cat])).length} spelare</div>` : ''}
         ${rows}
       </div>`;
   }).join('');
 
   return `<p class="section-title">Bonusfrågor</p>
     ${blocks}`;
+  } catch(err) {
+    return '<div style="color:red;padding:1rem;font-size:13px;">Fel i renderBonus: ' + err.message + '<br><pre>' + err.stack + '</pre></div>';
+  }
 }
 
 function renderKuriosa() {
@@ -1844,13 +1885,159 @@ let matchdayDate = null; // null = auto (today/next)
 let matchdayMode = 'all'; // always 'all' now
 
 const GROUP_LAST_MATCH = 72; // matches 1-72 = group stage (knockout teams not yet decided)
+const R32_MATCHES = [73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88];
+const KOBRACKET = {
+  89:[{win:74},{win:77}], 90:[{win:73},{win:75}], 91:[{win:76},{win:78}], 92:[{win:79},{win:80}],
+  93:[{win:83},{win:84}], 94:[{win:81},{win:82}], 95:[{win:86},{win:88}], 96:[{win:85},{win:87}],
+  97:[{win:89},{win:90}], 98:[{win:93},{win:94}], 99:[{win:91},{win:92}], 100:[{win:95},{win:96}],
+  101:[{win:97},{win:98}], 102:[{win:99},{win:100}],
+  103:[{lose:101},{lose:102}], 104:[{win:101},{win:102}]
+};
+const ADV_POINTS = { r32:1, r16:2, qf:4, sf:6, bronze:8, final:10 };
+const KO_ROUNDS = [
+  {key:'r32',label:'Sextondelsfinal',matches:R32_MATCHES,pts:1},
+  {key:'r16',label:'Åttondelsfinal',matches:[89,90,91,92,93,94,95,96],pts:2},
+  {key:'qf',label:'Kvartsfinal',matches:[97,98,99,100],pts:4},
+  {key:'sf',label:'Semifinal',matches:[101,102],pts:6},
+  {key:'bronze',label:'Bronsmatch',matches:[103],pts:8},
+  {key:'final',label:'Final',matches:[104],pts:10},
+];
+const BONUS_POINTS = [20,15,20,15,10,10,10];
 const BONUSDATA = {"categories": ["Skyttekung", "Världsmästare", "Vinnare bronsmatch", "Lag som gör flest mål i gruppspelet", "Lag som släpper in flest mål i gruppspelet", "Vem kommer sist i tippet?", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?"], "labels": ["Skyttekung", "Världsmästare", "Vinnare bronsmatch", "Lag som gör flest mål i gruppspelet", "Lag som släpper in flest mål i gruppspelet", "Vem kommer sist i tippet?", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?"], "bonus": {"Ralle": {"Skyttekung": "Mbappe", "Världsmästare": "Frankrike", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Kap Verde", "Vem kommer sist i tippet?": "Jocke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sex"}, "Sparris": {"Skyttekung": "Mbappe", "Världsmästare": "Frankrike", "Vinnare bronsmatch": "Portugal", "Lag som gör flest mål i gruppspelet": "Portugal", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Sparris", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}, "Simon": {"Skyttekung": "Kane", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Frankrike", "Lag som släpper in flest mål i gruppspelet": "Curaco", "Vem kommer sist i tippet?": "TF", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sex"}, "Meuller": {"Skyttekung": "Havertz", "Världsmästare": "England", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fyra"}, "Yngwe": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Brasilien", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Viking", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Två"}, "Albin": {"Skyttekung": "Deniz Undav", "Världsmästare": "Brasilien", "Vinnare bronsmatch": "Portugal", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}, "Felle": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Frankrike", "Lag som släpper in flest mål i gruppspelet": "Kap Verde", "Vem kommer sist i tippet?": "Viking", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Två"}, "Jarmo": {"Skyttekung": "Kane", "Världsmästare": "Holland", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "Frankrike", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Jarmo", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Åtta"}, "Larsa": {"Skyttekung": "Kane", "Världsmästare": "Frankrike", "Vinnare bronsmatch": "Argentina", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}, "Hilding": {"Skyttekung": "Kane", "Världsmästare": "England", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "England", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Tre"}, "Lundmark": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fyra"}, "TF": {"Skyttekung": "Raphinha", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Kap Verde", "Vem kommer sist i tippet?": "Tobbe", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Två"}, "Arke": {"Skyttekung": "Mbappe", "Världsmästare": "Frankrike", "Vinnare bronsmatch": "Spanien", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Viking", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}, "Fejb": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Brasilien", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Larsa", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sex"}, "Tobbe": {"Skyttekung": "Haaland", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Norge", "Lag som gör flest mål i gruppspelet": "Portugal", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Mange", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Tre"}, "Danne Beng": {"Skyttekung": "Kane", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Tyskland", "Lag som gör flest mål i gruppspelet": "Brasilien", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Arke", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fyra"}, "Knucke": {"Skyttekung": "Kane", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Portugal", "Lag som släpper in flest mål i gruppspelet": "Jordanien", "Vem kommer sist i tippet?": "Jarmo", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Tre"}, "Macke": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "England", "Lag som gör flest mål i gruppspelet": "Frankrike", "Lag som släpper in flest mål i gruppspelet": "Haiti", "Vem kommer sist i tippet?": "Viking", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sex"}, "Viking": {"Skyttekung": "Gyökeres", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "TF", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Nio"}, "Svante": {"Skyttekung": "Oyarzabal", "Världsmästare": "Spanien", "Vinnare bronsmatch": "England", "Lag som gör flest mål i gruppspelet": "Spanien", "Lag som släpper in flest mål i gruppspelet": "Uzbekistan", "Vem kommer sist i tippet?": "Larsa", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Sju"}, "Jocke": {"Skyttekung": "Mbappe", "Världsmästare": "Spanien", "Vinnare bronsmatch": "Frankrike", "Lag som gör flest mål i gruppspelet": "Tyskland", "Lag som släpper in flest mål i gruppspelet": "Curacao", "Vem kommer sist i tippet?": "Hilding", "Hur många mål gör Sverige totalt i turneringen (ej straffläggning)?": "Fem"}}};
 const KODATA = {"ko": {"Ralle": {"r32": ["Czechia", "Kanada", "Tyskland", "Australien", "Japan", "Brasilien", "Skottland", "Sverige", "Frankrike", "Nederländerna", "Elfenbenskusten", "Norge", "Mexiko", "Marocko", "England", "Senegal", "Turkiet", "Österrike", "Belgien", "Sydkorea", "Colombia", "Kroatien", "Spanien", "Algeriet", "Schweiz", "Iran", "Argentina", "Uruguay", "Portugal", "Ecuador", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Czechia", "Brasilien", "Sverige", "Norge", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Frankrike", "Brasilien", "Spanien", "Turkiet", "Norge", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "England", "Portugal"], "final": ["Frankrike", "England"]}, "Sparris": {"r32": ["Sydkorea", "Bosnien-Herzigovina", "Tyskland", "Marocko", "Nederländerna", "Skottland", "Brasilien", "Sverige", "Frankrike", "Japan", "Ecuador", "Norge", "Mexiko", "Elfenbenskusten", "England", "Senegal", "Turkiet", "Kanada", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Algeriet", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Sydkorea", "Skottland", "Brasilien", "Ecuador", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "Egypten", "Schweiz", "Portugal"], "qf": ["Frankrike", "Skottland", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "England", "Portugal"], "final": ["Frankrike", "England"]}, "Simon": {"r32": ["Mexiko", "Bosnien-Herzigovina", "Tyskland", "Skottland", "Nederländerna", "Brasilien", "Marocko", "Japan", "Frankrike", "Sverige", "Elfenbenskusten", "Norge", "Sydkorea", "Ecuador", "England", "Senegal", "Turkiet", "Kanada", "Belgien", "Czechia", "Colombia", "Ghana", "Spanien", "Österrike", "Schweiz", "Algeriet", "Argentina", "Uruguay", "Portugal", "Kroatien", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Mexiko", "Brasilien", "Marocko", "Norge", "Sydkorea", "England", "Colombia", "Spanien", "Turkiet", "Belgien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Frankrike", "Brasilien", "Spanien", "Turkiet", "Marocko", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "England", "Argentina"], "final": ["Spanien", "England"]}, "Meuller": {"r32": ["Czechia", "Kanada", "Tyskland", "Paraguay", "Nederländerna", "Marocko", "Brasilien", "Sverige", "Frankrike", "Japan", "Elfenbenskusten", "Norge", "Mexiko", "Skottland", "England", "Senegal", "USA", "Bosnien-Herzigovina", "Belgien", "Ecuador", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Algeriet", "Argentina", "Uruguay", "Portugal", "Ghana", "Turkiet", "Nya Zeeland"], "r16": ["Tyskland", "Frankrike", "Kanada", "Nederländerna", "Brasilien", "Norge", "Mexiko", "England", "Colombia", "Spanien", "USA", "Belgien", "Argentina", "Turkiet", "Schweiz", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Schweiz"], "sf": ["Frankrike", "Spanien", "England", "Argentina"], "final": ["Frankrike", "England"]}, "Yngwe": {"r32": ["Czechia", "Kanada", "Tyskland", "Paraguay", "Japan", "Marocko", "Brasilien", "Nederländerna", "Frankrike", "Sverige", "Ecuador", "Norge", "Mexiko", "Skottland", "England", "Elfenbenskusten", "Turkiet", "Algeriet", "Belgien", "Saudiarabien", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Egypten", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Iran"], "r16": ["Tyskland", "Frankrike", "Kanada", "Japan", "Brasilien", "Norge", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Saudiarabien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Frankrike", "Japan", "Spanien", "Turkiet", "Brasilien", "England", "Argentina", "Schweiz"], "sf": ["Frankrike", "Spanien", "Brasilien", "Argentina"], "final": ["Spanien", "Argentina"]}, "Albin": {"r32": ["Sydkorea", "Schweiz", "Tyskland", "Skottland", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Sverige", "Ecuador", "Norge", "Mexiko", "Uruguay", "England", "Senegal", "USA", "Kanada", "Belgien", "Czechia", "Portugal", "Kroatien", "Spanien", "Österrike", "Bosnien-Herzigovina", "Algeriet", "Argentina", "Saudiarabien", "Colombia", "Turkiet", "Paraguay", "Iran"], "r16": ["Tyskland", "Frankrike", "Sydkorea", "Nederländerna", "Brasilien", "Norge", "Mexiko", "England", "Portugal", "Spanien", "USA", "Belgien", "Argentina", "Iran", "Bosnien-Herzigovina", "Colombia"], "qf": ["Frankrike", "Nederländerna", "Portugal", "USA", "Brasilien", "England", "Argentina", "Bosnien-Herzigovina"], "sf": ["Frankrike", "Portugal", "Brasilien", "Argentina"], "final": ["Frankrike", "Brasilien"]}, "Felle": {"r32": ["Mexiko", "Kanada", "Tyskland", "Paraguay", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Sverige", "Ecuador", "Norge", "Sydkorea", "Skottland", "England", "Senegal", "Turkiet", "Elfenbenskusten", "Belgien", "Sydafrika", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Algeriet", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Mexiko", "Marocko", "Brasilien", "Norge", "Sydkorea", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "Egypten", "Schweiz", "Portugal"], "qf": ["Frankrike", "Marocko", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "Brasilien", "Portugal"], "final": ["Spanien", "Portugal"]}, "Jarmo": {"r32": ["Mexiko", "Bosnien-Herzigovina", "Tyskland", "Skottland", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Paraguay", "Ecuador", "Norge", "Sydkorea", "Saudiarabien", "England", "Kongo", "Turkiet", "Sverige", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Algeriet", "Schweiz", "Elfenbenskusten", "Argentina", "Uruguay", "Portugal", "Senegal", "USA", "Iran"], "r16": ["Tyskland", "Frankrike", "Mexiko", "Nederländerna", "Brasilien", "Norge", "Sydkorea", "England", "Kroatien", "Spanien", "Sverige", "Belgien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Nederländerna", "Spanien", "England", "Argentina"], "final": ["Nederländerna", "Argentina"]}, "Larsa": {"r32": ["Sydkorea", "Schweiz", "Tyskland", "Marocko", "Nederländerna", "Skottland", "Brasilien", "Japan", "Norge", "Sverige", "Elfenbenskusten", "Frankrike", "Mexiko", "Ecuador", "England", "Senegal", "Turkiet", "Bosnien-Herzigovina", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Österrike", "Kanada", "Algeriet", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Sverige", "Schweiz", "Nederländerna", "Brasilien", "Frankrike", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "Egypten", "Kanada", "Portugal"], "qf": ["Tyskland", "Nederländerna", "Spanien", "Belgien", "Frankrike", "England", "Argentina", "Kanada"], "sf": ["Tyskland", "Spanien", "Frankrike", "Argentina"], "final": ["Spanien", "Frankrike"]}, "Hilding": {"r32": ["Mexiko", "Kanada", "Tyskland", "Australien", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Sverige", "Ecuador", "Norge", "Czechia", "Skottland", "England", "Senegal", "USA", "Elfenbenskusten", "Belgien", "Uruguay", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Algeriet", "Argentina", "Saudiarabien", "Portugal", "Ghana", "Turkiet", "Iran"], "r16": ["Tyskland", "Frankrike", "Kanada", "Nederländerna", "Brasilien", "Norge", "Czechia", "England", "Kroatien", "Spanien", "USA", "Belgien", "Argentina", "Turkiet", "Schweiz", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "England", "Argentina"], "final": ["Frankrike", "England"]}, "Lundmark": {"r32": ["Sydkorea", "Kanada", "Tyskland", "Skottland", "Nederländerna", "Marocko", "Brasilien", "Sverige", "Frankrike", "Turkiet", "Elfenbenskusten", "Senegal", "Mexiko", "Ecuador", "England", "Uzbekistan", "USA", "Algeriet", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Iran", "Argentina", "Uruguay", "Portugal", "Norge", "Paraguay", "Egypten"], "r16": ["Tyskland", "Frankrike", "Kanada", "Nederländerna", "Brasilien", "Elfenbenskusten", "Mexiko", "England", "Kroatien", "Spanien", "USA", "Belgien", "Argentina", "Egypten", "Schweiz", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "England", "Argentina"], "final": ["Spanien", "England"]}, "TF": {"r32": ["Sydkorea", "Bosnien-Herzigovina", "Ecuador", "Paraguay", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Sverige", "Tyskland", "Senegal", "Mexiko", "Skottland", "Kroatien", "Norge", "USA", "Schweiz", "Belgien", "Czechia", "Colombia", "England", "Spanien", "Österrike", "Kanada", "Elfenbenskusten", "Argentina", "Uruguay", "Portugal", "Ghana", "Turkiet", "Egypten"], "r16": ["Ecuador", "Frankrike", "Sydkorea", "Marocko", "Brasilien", "Tyskland", "Mexiko", "Norge", "England", "Spanien", "USA", "Belgien", "Argentina", "Turkiet", "Kanada", "Portugal"], "qf": ["Frankrike", "Marocko", "Spanien", "Belgien", "Brasilien", "Norge", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "Brasilien", "Portugal"], "final": ["Spanien", "Portugal"]}, "Arke": {"r32": ["Czechia", "Schweiz", "Tyskland", "Paraguay", "Nederländerna", "Marocko", "Brasilien", "Sverige", "Frankrike", "Japan", "Ecuador", "Norge", "Mexiko", "Elfenbenskusten", "England", "Senegal", "Turkiet", "Bosnien-Herzigovina", "Belgien", "Sydkorea", "Colombia", "Kroatien", "Spanien", "Österrike", "Kanada", "Iran", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Czechia", "Nederländerna", "Brasilien", "Ecuador", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "USA", "Kanada", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "Brasilien", "Argentina"], "final": ["Frankrike", "Argentina"]}, "Fejb": {"r32": ["Sydkorea", "Bosnien-Herzigovina", "Tyskland", "Paraguay", "Nederländerna", "Marocko", "Brasilien", "Sverige", "Frankrike", "Japan", "Ecuador", "Norge", "Mexiko", "Skottland", "England", "Senegal", "Turkiet", "Kanada", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Algeriet", "Argentina", "Uruguay", "Portugal", "Elfenbenskusten", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Sydkorea", "Nederländerna", "Brasilien", "Norge", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "Egypten", "Schweiz", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Turkiet", "Brasilien", "Mexiko", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "Brasilien", "Portugal"], "final": ["Spanien", "Brasilien"]}, "Tobbe": {"r32": ["Sydkorea", "Kanada", "Tyskland", "Paraguay", "Nederländerna", "Marocko", "Brasilien", "Japan", "Norge", "Sverige", "Ecuador", "Frankrike", "Mexiko", "Skottland", "England", "Senegal", "Turkiet", "Bosnien-Herzigovina", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Elfenbenskusten", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Norge", "Sydkorea", "Marocko", "Brasilien", "Frankrike", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Norge", "Marocko", "Spanien", "Turkiet", "Frankrike", "England", "Argentina", "Portugal"], "sf": ["Norge", "Spanien", "Frankrike", "Portugal"], "final": ["Spanien", "Portugal"]}, "Danne Beng": {"r32": ["Czechia", "Bosnien-Herzigovina", "Tyskland", "Skottland", "Nederländerna", "Marocko", "Brasilien", "Sverige", "Frankrike", "Japan", "Ecuador", "Norge", "Mexiko", "Saudiarabien", "England", "Algeriet", "USA", "Kanada", "Belgien", "Sydkorea", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Iran", "Argentina", "Uruguay", "Portugal", "Elfenbenskusten", "Turkiet", "Egypten"], "r16": ["Tyskland", "Frankrike", "Czechia", "Nederländerna", "Brasilien", "Norge", "Mexiko", "England", "Kroatien", "Spanien", "Kanada", "Sydkorea", "Argentina", "Egypten", "Schweiz", "Portugal"], "qf": ["Tyskland", "Nederländerna", "Spanien", "Sydkorea", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Tyskland", "Spanien", "England", "Argentina"], "final": ["Spanien", "England"]}, "Knucke": {"r32": ["Czechia", "Kanada", "Tyskland", "Skottland", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Sverige", "Elfenbenskusten", "Norge", "Mexiko", "Ecuador", "England", "Senegal", "Turkiet", "Algeriet", "Belgien", "Sydkorea", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Iran", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Czechia", "Marocko", "Brasilien", "Norge", "Mexiko", "England", "Kroatien", "Spanien", "Turkiet", "Belgien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Frankrike", "Marocko", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "Brasilien", "Portugal"], "final": ["Spanien", "Brasilien"]}, "Macke": {"r32": ["Sydkorea", "Kanada", "Tyskland", "Skottland", "Japan", "Marocko", "Brasilien", "Nederländerna", "Frankrike", "Sverige", "Ecuador", "Norge", "Mexiko", "Elfenbenskusten", "England", "Senegal", "USA", "Bosnien-Herzigovina", "Belgien", "Saudiarabien", "Portugal", "Kroatien", "Uruguay", "Österrike", "Schweiz", "Iran", "Argentina", "Spanien", "Colombia", "Ghana", "Turkiet", "Egypten"], "r16": ["Tyskland", "Frankrike", "Sydkorea", "Japan", "Brasilien", "Norge", "Mexiko", "England", "Kroatien", "Uruguay", "USA", "Belgien", "Spanien", "Turkiet", "Schweiz", "Colombia"], "qf": ["Frankrike", "Japan", "Kroatien", "Belgien", "Norge", "England", "Spanien", "Colombia"], "sf": ["Frankrike", "Kroatien", "England", "Spanien"], "final": ["Frankrike", "Spanien"]}, "Viking": {"r32": ["Mexiko", "Schweiz", "Tyskland", "Skottland", "Sverige", "Marocko", "Brasilien", "Nederländerna", "Frankrike", "Australien", "Elfenbenskusten", "Norge", "Czechia", "Ecuador", "England", "Senegal", "Turkiet", "Kanada", "Belgien", "Sydkorea", "Colombia", "Kroatien", "Spanien", "Österrike", "Bosnien-Herzigovina", "Algeriet", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Nya Zeeland"], "r16": ["Tyskland", "Frankrike", "Mexiko", "Sverige", "Brasilien", "Norge", "Czechia", "England", "Kroatien", "Spanien", "Kanada", "Belgien", "Argentina", "USA", "Bosnien-Herzigovina", "Portugal"], "qf": ["Frankrike", "Sverige", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Portugal"], "sf": ["Frankrike", "Spanien", "England", "Portugal"], "final": ["Spanien", "Portugal"]}, "Svante": {"r32": ["Sydkorea", "Kanada", "Tyskland", "Australien", "Nederländerna", "Marocko", "Brasilien", "Sverige", "Frankrike", "Japan", "Ecuador", "Norge", "Mexiko", "Skottland", "England", "Senegal", "Turkiet", "Bosnien-Herzigovina", "Belgien", "Algeriet", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Iran", "Argentina", "Uruguay", "Portugal", "Ghana", "USA", "Egypten"], "r16": ["Tyskland", "Frankrike", "Kanada", "Nederländerna", "Brasilien", "Norge", "Skottland", "England", "Kroatien", "Spanien", "Bosnien-Herzigovina", "Belgien", "Argentina", "USA", "Schweiz", "Portugal"], "qf": ["Tyskland", "Nederländerna", "Spanien", "Belgien", "Norge", "England", "Argentina", "Portugal"], "sf": ["Tyskland", "Spanien", "England", "Portugal"], "final": ["Spanien", "Portugal"]}, "Jocke": {"r32": ["Sydkorea", "Kanada", "Tyskland", "Skottland", "Nederländerna", "Marocko", "Brasilien", "Japan", "Frankrike", "Sverige", "Ecuador", "Norge", "Mexiko", "Elfenbenskusten", "England", "Algeriet", "USA", "Bosnien-Herzigovina", "Belgien", "Czechia", "Colombia", "Kroatien", "Spanien", "Österrike", "Schweiz", "Iran", "Argentina", "Uruguay", "Portugal", "Senegal", "Turkiet", "Egypten"], "r16": ["Tyskland", "Frankrike", "Sydkorea", "Nederländerna", "Brasilien", "Norge", "Mexiko", "England", "Colombia", "Spanien", "USA", "Belgien", "Argentina", "Egypten", "Schweiz", "Portugal"], "qf": ["Frankrike", "Nederländerna", "Spanien", "Belgien", "Brasilien", "England", "Argentina", "Schweiz"], "sf": ["Frankrike", "Spanien", "England", "Argentina"], "final": ["Spanien", "Argentina"]}}};
+// ── Avancemangs-motor ────────────────────────────────────────────────
+function koMatchTeams(m) {
+  if (R32_MATCHES.includes(m)) return ADVANCERS.r32[m] || [null,null];
+  const src = KOBRACKET[m]; if (!src) return [null,null];
+  const W = ADVANCERS.winners || {};
+  const resolve = s => {
+    if (s.win != null) return W[s.win] || null;
+    if (s.lose != null) { const t = koMatchTeams(s.lose), w = W[s.lose];
+      if (!t || !w || !t[0] || !t[1]) return null; return t[0]===w ? t[1] : t[0]; }
+    return null;
+  };
+  return [resolve(src[0]), resolve(src[1])];
+}
+function advancedSets() {
+  const W = ADVANCERS.winners || {};
+  const setFrom = nums => { const s=new Set(); nums.forEach(n=>{if(W[n])s.add(W[n]);}); return s; };
+  const r32 = new Set();
+  R32_MATCHES.forEach(m=>{const t=ADVANCERS.r32[m]; if(t){if(t[0])r32.add(t[0]); if(t[1])r32.add(t[1]);}});
+  const r16 = setFrom([73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88]);
+  const qf  = setFrom([89,90,91,92,93,94,95,96]);
+  const sf  = setFrom([97,98,99,100]);
+  const final = setFrom([101,102]);
+  const bronze = new Set();
+  [101,102].forEach(m=>{const t=koMatchTeams(m),w=W[m]; if(t&&w&&t[0]&&t[1])bronze.add(t[0]===w?t[1]:t[0]);});
+  return {r32,r16,qf,sf,bronze,final};
+}
+function advancementPoints(player) {
+  const ko = KODATA.ko[player]; if (!ko) return 0;
+  const s = advancedSets(); let pts=0;
+  (ko.r32||[]).forEach(t=>{if(s.r32.has(t))pts+=ADV_POINTS.r32;});
+  (ko.r16||[]).forEach(t=>{if(s.r16.has(t))pts+=ADV_POINTS.r16;});
+  (ko.qf||[]).forEach(t=>{if(s.qf.has(t))pts+=ADV_POINTS.qf;});
+  (ko.sf||[]).forEach(t=>{if(s.sf.has(t))pts+=ADV_POINTS.sf;});
+  (ko.final||[]).forEach(t=>{if(s.final.has(t))pts+=ADV_POINTS.final;});
+  const bp=(ko.sf||[]).filter(t=>!(ko.final||[]).includes(t));
+  bp.forEach(t=>{if(s.bronze.has(t))pts+=ADV_POINTS.bronze;});
+  return pts;
+}
+function hasAdvData() { return Object.keys(ADVANCERS.r32||{}).length>0 || Object.keys(ADVANCERS.winners||{}).length>0; }
+// ── Bonus-motor ──────────────────────────────────────────────────────
+function normBonus(v) { return String(v==null?'':v).trim().toLowerCase(); }
+function bonusMatch(ci, ans, facit) {
+  if (ci===6) { const a=parseFloat(String(ans).replace(',','.')), f=parseFloat(String(facit).replace(',','.')); if(!isNaN(a)&&!isNaN(f)) return a===f; }
+  return normBonus(ans)===normBonus(facit);
+}
+function bonusPoints(player) {
+  let pts=0;
+  BONUSDATA.categories.forEach((cat,ci)=>{ const f=BONUSFACIT[cat]; if(f==null||f==='')return;
+    const ans=(BONUSDATA.bonus[player]||{})[cat]; if(ans!=null&&bonusMatch(ci,ans,f)) pts+=BONUS_POINTS[ci]; });
+  return pts;
+}
+function hasBonusFacit() { return Object.values(BONUSFACIT||{}).some(v=>v!=null&&v!==''); }
+async function setBonusFacit(ci, value) {
+  const cat=BONUSDATA.categories[ci]; if(value==null||value==='') delete BONUSFACIT[cat]; else BONUSFACIT[cat]=value;
+  await saveBonusFacit(); await loadSnapshots(); currentData=liveCurrentData();
+  renderLeaderboard(currentData); renderChart(); renderMetricCards(); renderBonus();
+}
+// ── KO-admin ───────────────────────────────────────────────────────────
+function allTeams() {
+  const s=new Set();
+  VMDATA.schedule.filter(m=>m.n<=GROUP_LAST_MATCH).forEach(m=>{s.add(m.h);s.add(m.a);});
+  return [...s].sort((a,b)=>a.localeCompare(b,'sv'));
+}
+function matchTeams(m) {
+  if (m.n > GROUP_LAST_MATCH) { const t=koMatchTeams(m.n); return [t[0]||'?', t[1]||'?']; }
+  return [m.h, m.a];
+}
+function validateWinners() {
+  let ch=true; while(ch){ch=false; Object.keys(ADVANCERS.winners||{}).forEach(k=>{
+    const mn=Number(k),t=koMatchTeams(mn),w=ADVANCERS.winners[k];
+    if(!t||!t.includes(w)){delete ADVANCERS.winners[k];ch=true;}});}
+}
+async function persistAdv() {
+  validateWinners(); await saveAdvancers(); await loadSnapshots(); currentData=liveCurrentData();
+  renderLeaderboard(currentData); renderChart(); renderMetricCards(); renderMatchday();
+}
+async function saveR32Match(m) {
+  const a=document.getElementById('r32a-'+m).value.trim();
+  const b=document.getElementById('r32b-'+m).value.trim();
+  if(!a||!b){setStatus('Välj båda lagen.',true);return;}
+  if(a===b){setStatus('Lagen måste vara olika.',true);return;}
+  ADVANCERS.r32[m]=[a,b]; await persistAdv();
+}
+async function setKoWinner(m, team) {
+  if((ADVANCERS.winners||{})[m]===team) delete ADVANCERS.winners[m]; else ADVANCERS.winners[m]=team;
+  await persistAdv();
+  const sched=VMDATA.schedule.find(s=>s.n===m);
+  if(sched) await autoSnapshotIfComplete(sched.d);
+}
+async function clearAdvancers() {
+  if(!confirm('Rensa all slutspelsdata? Detta tar bort avancemang och vinnare.')) return;
+  loading(true,'Rensar slutspel...');
+  try {
+    const rows = await supabase('GET','snapshots?label=eq.__ADVANCERS__&select=id') || [];
+    for(const r of rows){try{await supabase('DELETE','snapshots?id=eq.'+r.id);}catch(e){}}
+    ADVANCERS={r32:{},winners:{}}; _advRowId=null;
+    const btn=document.getElementById('clearAdvBtn'); if(btn)btn.style.display='none';
+    await persistAdv(); setStatus('Slutspelsdata rensad.');
+  }catch(e){setStatus('Fel: '+e.message,true);}finally{loading(false);}
+}
+function renderAdvTable() {
+  const pls = VMDATA.players;
+  const s = advancedSets();
+  const activeRounds = KO_ROUNDS.filter(r => s[r.key] && s[r.key].size > 0);
+  if (!activeRounds.length) return '<p style="font-size:13px;color:var(--muted);">Slutspelet har inte börjat än.</p>';
+  const rows = pls.map(p=>({p,pts:advancementPoints(p)})).sort((a,b)=>b.pts-a.pts||a.p.localeCompare(b.p,'sv'));
+  return `<table style="width:100%;border-collapse:collapse;font-size:13px;">
+    <thead><tr style="color:var(--muted);font-size:11px;">
+      <th style="text-align:left;padding:4px 0;">#</th><th style="text-align:left;padding:4px 4px;">Namn</th>
+      ${activeRounds.map(r=>`<th style="text-align:right;padding:4px 4px;">${r.label.substring(0,3)}</th>`).join('')}
+      <th style="text-align:right;padding:4px 0;">Tot</th>
+    </tr></thead><tbody>
+    ${rows.map(({p,pts},i)=>{
+      const ko=KODATA.ko[p]||{};
+      return `<tr style="border-top:1px solid var(--border);">
+        <td style="padding:6px 0;color:var(--muted);">${i+1}</td>
+        <td style="padding:6px 4px;color:var(--text);">${escHtml(p)}</td>
+        ${activeRounds.map(r=>{
+          const cnt=r.key==='bronze'
+            ?(ko.sf||[]).filter(t=>!(ko.final||[]).includes(t)&&s.bronze.has(t)).length*ADV_POINTS.bronze
+            :(ko[r.key]||[]).filter(t=>s[r.key].has(t)).length*(ADV_POINTS[r.key]||0);
+          return `<td style="text-align:right;padding:6px 4px;color:${cnt>0?'var(--yellow)':'var(--muted)'};">${cnt||'–'}</td>`;
+        }).join('')}
+        <td style="text-align:right;padding:6px 0;font-weight:600;color:${pts>0?'var(--yellow)':'var(--muted)'};">${pts||'–'}</td>
+      </tr>`;
+    }).join('')}
+    </tbody></table>`;
+}
 function matchdaySchedule() {
-  return VMDATA.schedule.filter(m => m.n <= GROUP_LAST_MATCH);
+  return VMDATA.schedule;  // alla matcher inkl. slutspel
 }
 function allMatchDates() {
-  return [...new Set(matchdaySchedule().map(m => m.d))].sort();
+  return [...new Set(VMDATA.schedule.map(m => m.d))].sort();
 }
 
 function autoMatchday() {
@@ -1872,6 +2059,10 @@ function goToCurrentMatchday() {
   renderMatchday();
 }
 
+function escHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
 function shortDate(dstr) {
   const d = new Date(dstr + 'T12:00:00');
   const months = ['jan','feb','mar','apr','maj','jun','jul','aug','sep','okt','nov','dec'];
@@ -1890,8 +2081,24 @@ function outcomeLabel(x) {
   return 'X';
 }
 
+
+function renderPlayedHeader(m, res) {
+  const [_ph,_pa] = matchTeams(m);
+  const koR2 = m.n > GROUP_LAST_MATCH ? KO_ROUNDS.find(r=>r.matches.includes(m.n)) : null;
+  const winnerTeam = (ADVANCERS.winners||{})[m.n];
+  let koInfo = '';
+  if (koR2) {
+    koInfo = '<div style="font-size:11px;color:var(--muted);margin-bottom:2px;">Match ' + m.n + ' · ' + koR2.label + (winnerTeam ? ' · ✓ ' + escHtml(winnerTeam) + ' gick vidare' : '') + '</div>';
+  }
+  return koInfo + '<div style="display:flex;align-items:center;gap:8px;">'
+    + '<span style="flex:1;font-size:14px;color:var(--text);text-align:right;font-weight:500;">' + escHtml(_ph) + '</span>'
+    + '<span style="font-family:Bebas Neue,sans-serif;font-size:1.45rem;color:var(--yellow);min-width:54px;text-align:center;">' + res[0] + '–' + res[1] + '</span>'
+    + '<span style="flex:1;font-size:14px;color:var(--text);font-weight:500;">' + escHtml(_pa) + '</span>'
+    + '</div>';
+}
 function renderMatchday() {
   const el = document.getElementById('matchdayView');
+  try {
   const dates = allMatchDates();
   const active = resolveMatchday();
   const matches = matchdaySchedule().filter(m => m.d === active);
@@ -1940,7 +2147,7 @@ function renderMatchday() {
     // Allas tips — per match, chips for every player (facit-medveten)
     const sortedPlayers = VMDATA.players.slice().sort((a,b)=>a.localeCompare(b,'sv'));
     body = matches.map(m => {
-      const res = FACIT[m.n];
+      const res = FACIT[String(m.n)];
       const played = Array.isArray(res);
 
       // Sammanfattning + header för spelade matcher
@@ -1954,13 +2161,14 @@ function renderMatchday() {
           if (matchPoints(t, res) >= 3) outcome++;
         });
         header = `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-            <span style="flex:1;font-size:14px;color:var(--text);text-align:right;font-weight:500;">${m.h}</span>
-            <span style="font-family:'Bebas Neue',sans-serif;font-size:1.45rem;color:var(--yellow);min-width:54px;text-align:center;">${res[0]}–${res[1]}</span>
-            <span style="flex:1;font-size:14px;color:var(--text);font-weight:500;">${m.a}</span>
+${renderPlayedHeader(m, res)}
           </div>`;
         extra = `<div style="font-size:12px;color:var(--muted);margin-bottom:10px;text-align:center;">🎯 ${exact} exakt · ✓ ${outcome} rätt utfall <span style="opacity:0.6;">av ${counted}</span></div>`;
       } else {
-        header = `<div style="font-size:14px;color:var(--text);margin-bottom:8px;font-weight:500;">${m.h} <span style="color:var(--muted);font-weight:400;">–</span> ${m.a}</div>`;
+        const [_uh, _ua] = matchTeams(m);
+        const koRound = m.n > GROUP_LAST_MATCH ? KO_ROUNDS.find(r=>r.matches.includes(m.n)) : null;
+        const koLabel = koRound ? `<div style="font-size:11px;color:var(--muted);margin-bottom:4px;">Match ${m.n} · ${koRound.label}</div>` : '';
+        header = koLabel + `<div style="font-size:14px;color:var(--text);margin-bottom:8px;font-weight:500;">${escHtml(_uh)} <span style="color:var(--muted);font-weight:400;">–</span> ${escHtml(_ua)}</div>`;
         extra = matchInsight(m);
       }
 
@@ -1995,15 +2203,35 @@ function renderMatchday() {
           ? 'padding:5px 12px;border-radius:6px;font-size:12px;border:1px solid var(--border);background:var(--surface);color:var(--muted);cursor:pointer;font-family:\'DM Sans\',sans-serif;'
           : 'padding:5px 12px;border-radius:6px;font-size:12px;border:1px solid var(--yellow);background:rgba(255,218,0,0.12);color:var(--yellow);cursor:pointer;font-family:\'DM Sans\',sans-serif;font-weight:600;';
         const btnLabel = existing ? 'Ändra' : 'Spara';
-        return `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-          <span style="font-size:12px;color:var(--muted);flex:none;">Resultat:</span>
-          <span style="flex:1;text-align:right;font-size:14px;color:var(--text);">${m.h}</span>
-          <input id="res-h-${m.n}" type="number" min="0" value="${hVal}" placeholder="H" style="width:48px;padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:14px;text-align:center;font-family:\'DM Sans\',sans-serif;">
-          <span style="color:var(--muted);">–</span>
-          <input id="res-a-${m.n}" type="number" min="0" value="${aVal}" placeholder="B" style="width:48px;padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:14px;text-align:center;font-family:\'DM Sans\',sans-serif;">
-          <span style="font-size:14px;color:var(--text);">${m.a}</span>
-          <button onclick="saveMatchResult(${m.n}, '${active}')" style="${btnStyle}">${btnLabel}</button>
-        </div>`;
+        const [_ra, _rb] = matchTeams(m);
+        return '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'
+          + '<span style="font-size:12px;color:var(--muted);flex:none;">Resultat:</span>'
+          + '<span style="flex:1;text-align:right;font-size:14px;color:var(--text);">' + escHtml(_ra) + '</span>'
+          + '<input id="res-h-' + m.n + '" type="number" min="0" value="' + hVal + '" placeholder="H" style="width:48px;padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:14px;text-align:center;">'
+          + '<span style="color:var(--muted);">&#8211;</span>'
+          + '<input id="res-a-' + m.n + '" type="number" min="0" value="' + aVal + '" placeholder="B" style="width:48px;padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:14px;text-align:center;">'
+          + '<span style="font-size:14px;color:var(--text);">' + escHtml(_rb) + '</span>'
+          + '<button onclick="saveMatchResult(' + m.n + ', \'' + active + '\')" style="' + btnStyle + '">' + btnLabel + '</button>'
+          + '</div>'
+          + (m.n > GROUP_LAST_MATCH ? (() => {
+          const teams = allTeams();
+          const teamOpts = t => teams.map(tm=>`<option value="${escHtml(tm)}"${tm===t?' selected':''}>${escHtml(tm)}</option>`).join('');
+          const r32t = ADVANCERS.r32[m.n] || [null,null];
+          const currWinner = (ADVANCERS.winners||{})[m.n];
+          const [kt1,kt2] = koMatchTeams(m.n);
+          if (R32_MATCHES.includes(m.n)) {
+            let ctrl = `<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+              <select id="r32a-${m.n}" style="flex:1;min-width:90px;padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px;"><option value="">Hemmalag</option>${teamOpts(r32t[0])}</select>
+              <select id="r32b-${m.n}" style="flex:1;min-width:90px;padding:5px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px;"><option value="">Bortalag</option>${teamOpts(r32t[1])}</select>
+              <button onclick="saveR32Match(${m.n})" style="padding:5px 10px;border-radius:6px;font-size:12px;border:1px solid var(--yellow);background:rgba(255,218,0,0.12);color:var(--yellow);cursor:pointer;">Sätt lag</button></div>`;
+            if (r32t[0]&&r32t[1]) ctrl += `<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;"><span style="font-size:12px;color:var(--muted);align-self:center;">Vidare:</span>${[r32t[0],r32t[1]].map(t=>`<button onclick="setKoWinner(${m.n},'${escHtml(t)}')" style="padding:4px 10px;border-radius:6px;font-size:12px;border:1px solid ${currWinner===t?'var(--yellow)':'var(--border)'};background:${currWinner===t?'rgba(255,218,0,0.18)':'var(--surface)'};color:${currWinner===t?'var(--yellow)':'var(--text)'};cursor:pointer;">${escHtml(t)}</button>`).join('')}</div>`;
+            return ctrl;
+          } else if (kt1&&kt2) {
+            return `<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;"><span style="font-size:12px;color:var(--muted);align-self:center;">Vidare:</span>${[kt1,kt2].map(t=>`<button onclick="setKoWinner(${m.n},'${escHtml(t)}')" style="padding:4px 10px;border-radius:6px;font-size:12px;border:1px solid ${currWinner===t?'var(--yellow)':'var(--border)'};background:${currWinner===t?'rgba(255,218,0,0.18)':'var(--surface)'};color:${currWinner===t?'var(--yellow)':'var(--text)'};cursor:pointer;">${escHtml(t)}</button>`).join('')}</div>`;
+          } else {
+            return `<div style="margin-top:6px;font-size:12px;color:var(--muted);">Väntar på tidigare slutspelsresultat</div>`;
+          }
+        })() : '');
       })() : '';
       return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1rem 1.1rem;margin-bottom:12px;">
         ${header}
@@ -2042,6 +2270,9 @@ function renderMatchday() {
     ${body}
     ${active === allMatchDates()[allMatchDates().length-1] ? '<p style="font-size:12px;color:var(--muted);margin-top:12px;text-align:center;">Slutspelet visas här när gruppspelet är avgjort</p>' : ''}
   `;
+  } catch(err) {
+    el.innerHTML = '<div style="color:red;padding:1rem;font-size:13px;">Fel i renderMatchday: ' + err.message + '<br><pre>' + err.stack + '</pre></div>';
+  }
 }
 
 function setMatchdayMode(mode) {
@@ -2078,7 +2309,8 @@ function matchInsight(m) {
   const domShare = counts[dom] / total;
 
   let contraLine = '';
-  const phrase = o => o === 'X' ? 'oavgjort' : (o === '1' ? m.h : m.a) + '-vinst';
+  const [_mh, _ma] = matchTeams(m);
+const phrase = o => o === 'X' ? 'oavgjort' : (o === '1' ? _mh : _ma) + '-vinst';
   const maxCount = Math.max(counts['1'], counts['X'], counts['2']);
   const groups = [];
   // Rare decisive picks: only 1-2 people tipped a home/away win the rest avoided
