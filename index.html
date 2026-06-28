@@ -2020,7 +2020,7 @@ function renderAdvTable() {
   return `<table style="width:100%;border-collapse:collapse;font-size:13px;">
     <thead><tr style="color:var(--muted);font-size:11px;">
       <th style="text-align:left;padding:4px 0;">#</th><th style="text-align:left;padding:4px 4px;">Namn</th>
-      ${activeRounds.map(r=>`<th style="text-align:right;padding:4px 4px;">${r.label.substring(0,3)}</th>`).join('')}
+      ${activeRounds.map(r=>`<th style="text-align:right;padding:4px 4px;">${r.key==='r32'?'16-del':r.key==='r16'?'8-del':r.key==='qf'?'Kvart':r.key==='sf'?'Semi':r.key==='bronze'?'Brons':'Final'}</th>`).join('')}
       <th style="text-align:right;padding:4px 0;">Tot</th>
     </tr></thead><tbody>
     ${rows.map(({p,pts},i)=>{
