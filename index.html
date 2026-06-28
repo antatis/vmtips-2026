@@ -1729,7 +1729,7 @@ function renderBonus() {
     return `<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1rem 1.1rem;margin-bottom:12px;">
         ${adminMode ? `<div style="margin-bottom:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
           <span style="font-size:14px;color:var(--yellow);font-weight:500;flex:1;">${escHtml(labels[ci])}</span>
-          <input id="bfacit-${ci}" list="bfacit-list-${ci}" value="${escHtml(BONUSFACIT[cat]||'')}" placeholder="Facit..." style="flex:1;min-width:100px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px;font-family:'DM Sans',sans-serif;">
+          <input id="bfacit-${ci}" list="bfacit-list-${ci}" value="${escHtml(BONUSFACIT[cat]||'')}" placeholder="${ci===6 ? 'Facit (antal)...' : 'Facit (flera = komma)...'}" style="flex:1;min-width:100px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:12px;font-family:'DM Sans',sans-serif;">
           <datalist id="bfacit-list-${ci}">${[...new Set(Object.values(BONUSDATA.bonus).map(b=>b[cat]).filter(Boolean))].map(v=>`<option value="${escHtml(v)}">`).join('')}</datalist>
           <button onclick="setBonusFacit(${ci}, document.getElementById('bfacit-${ci}').value)" style="padding:4px 10px;border-radius:6px;font-size:12px;border:1px solid var(--yellow);background:rgba(255,218,0,0.12);color:var(--yellow);cursor:pointer;">Spara</button>
         </div>` : `<div style="font-size:14px;color:var(--yellow);font-weight:500;margin-bottom:8px;">${escHtml(labels[ci])}</div>`}
@@ -1945,10 +1945,16 @@ function advancementPoints(player) {
 }
 function hasAdvData() { return Object.keys(ADVANCERS.r32||{}).length>0 || Object.keys(ADVANCERS.winners||{}).length>0; }
 // ── Bonus-motor ──────────────────────────────────────────────────────
-function normBonus(v) { return String(v==null?'':v).trim().toLowerCase(); }
-function bonusMatch(ci, ans, facit) {
-  if (ci===6) { const a=parseFloat(String(ans).replace(',','.')), f=parseFloat(String(facit).replace(',','.')); if(!isNaN(a)&&!isNaN(f)) return a===f; }
-  return normBonus(ans)===normBonus(facit);
+function normBonus(v){ return String(v==null?'':v).trim().toLowerCase(); }
+function bonusMatch(ci, ans, facit){
+  if(facit==null || facit==='') return false;
+  if(ci===6){ // Sveriges mål — enkelt tal
+    const a=parseFloat(String(ans).replace(',','.')), f=parseFloat(String(facit).replace(',','.'));
+    if(!isNaN(a)&&!isNaN(f)) return a===f;
+    return normBonus(ans)===normBonus(facit);
+  }
+  const facits = String(facit).split(',').map(normBonus).filter(x=>x);
+  return facits.includes(normBonus(ans));
 }
 function bonusPoints(player) {
   let pts=0;
